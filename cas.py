@@ -2,10 +2,11 @@
 # -*- coding: utf-8 -*-
 
 from argparse import ArgumentParser
-from tempfile import TemporaryDirectory
+from tempfile import TemporaryDirectory, NamedTemporaryFile
 import logging
 import cv2
 import asyncio
+import ffmpeg
 from pathlib import Path
 from wand.image import Image
 
@@ -66,15 +67,15 @@ ap.add_argument(
 )
 ap.add_argument(
     '--vibrato-frequency','--vibrato-freq',  '-f',
-    default = 5.0,
+    default = 10.0,
     type = float,
-    help = 'Modulation frequency in Hertz. Range is 0.1 - 20000.0. Default value is 5.0 Hz.'
+    help = 'Modulation frequency in Hertz. Range is 0.1 - 20000.0. Default value is 10.0 Hz.'
 )
 ap.add_argument(
     '--vibrato-modulation-depth','--vibrato-depth',  '-m',
-    default = 0.5,
+    default = 1.0,
     type = float,
-    help = 'Depth of modulation as a percentage. Range is 0.0 - 1.0. Default value is 0.5.'
+    help = 'Depth of modulation as a percentage. Range is 0.0 - 1.0. Default value is 1.0.'
 )
 ap.add_argument(
     '--debug',
@@ -170,6 +171,23 @@ async def distort_video(capture, output, distort_start, distort_end=None, distor
 
     log.debug('done with distorting video frames')
 
+def distort_audio(distorted_video, in_audio, audio_freq, audio_mod, out_filename):
+    video = ffmpeg.input(distorted_video).video
+    audio = ffmpeg.input(in_audio).audio.filter(
+        "vibrato",
+        f=audio_freq,
+        d=audio_mod
+        # Documentation : https://ffmpeg.org/ffmpeg-filters.html#vibrato
+    )
+    (
+        ffmpeg
+        .concat(video, audio, v=1, a=1) # v = video stream, a = audio stream
+        .output(out_filename)
+        .run(overwrite_output=True)
+        # Documentation : https://kkroening.github.io/ffmpeg-python/
+    )
+
+
 def main():
     args = ap.parse_args()
     if args.debug:
@@ -184,12 +202,17 @@ def main():
     fps = capture.get(cv2.CAP_PROP_FPS)
     video_width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH))
     video_height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    frames = args.distort_end or int(capture.get(cv2.CAP_PROP_FRAME_COUNT))
+    frames = int(capture.get(cv2.CAP_PROP_FRAME_COUNT))
     log.info("video: name:'%s', fps:%i, frames:%i, size:%ix%i", args.input, fps, frames, video_width, video_height)
-    output = cv2.VideoWriter(args.output, cv2.VideoWriter_fourcc(*'mp4v'), fps, (video_width, video_height))
-    asyncio.run(distort_video(capture, output, args.distort_percentage, args.distort_percentage_end, frames-1))
-    capture.release()
-    output.release()
+    if args.distort_end:
+        frames *= (args.distort_end / 100.)
+    with TemporaryDirectory() as tmpout:
+        tmpout = Path(tmpout) / 'tmp.mp4'
+        output = cv2.VideoWriter(str(tmpout), cv2.VideoWriter_fourcc(*'mp4v'), fps, (video_width, video_height))
+        asyncio.run(distort_video(capture, output, args.distort_percentage, args.distort_percentage_end, frames-1))
+        capture.release()
+        output.release()
+        distort_audio(tmpout, args.input, args.vibrato_frequency, args.vibrato_modulation_depth, args.output)
 
 
 if __name__ == '__main__':
