@@ -7,6 +7,7 @@ import logging
 import cv2
 import asyncio
 import ffmpeg
+from shutil import move
 from pathlib import Path
 from wand.image import Image
 
@@ -48,16 +49,18 @@ class TicketedDict(dict):
 ap.add_argument('input')
 ap.add_argument('output')
 ap.add_argument(
-    '--distort-percentage','--distort-pct',  '-d', 
+    '--distort-scale', '-d', 
     default = 60.0,
     type = float,
-    help = 'Percentage of image distortion.'
+    help = 'Percentage of image scale.',
+    dest = 'distort_percentage'
 )
 ap.add_argument(
-    '--distort-percentage-end','--distort-pct-end',  '-D', 
+    '--distort-scale-end', '-D', 
     default = None,
     type = float,
-    help = 'If specified, distortion percentage will gradually change towards specified percentage.'
+    help = 'If specified, scaling will gradually change towards specified percentage.',
+    dest = 'distort_percentage_end'
 )
 ap.add_argument(
     '--distort-end','--distort',  '-E', 
@@ -67,15 +70,15 @@ ap.add_argument(
 )
 ap.add_argument(
     '--vibrato-frequency','--vibrato-freq',  '-f',
-    default = 10.0,
+    default = None,
     type = float,
-    help = 'Modulation frequency in Hertz. Range is 0.1 - 20000.0. Default value is 10.0 Hz.'
+    help = 'Modulation frequency in Hertz. Range is 0.1 - 20000.0. Recommended value is 10.0 Hz.'
 )
 ap.add_argument(
     '--vibrato-modulation-depth','--vibrato-depth',  '-m',
-    default = 1.0,
+    default = None,
     type = float,
-    help = 'Depth of modulation as a percentage. Range is 0.0 - 1.0. Default value is 1.0.'
+    help = 'Depth of modulation as a percentage. Range is 0.0 - 1.0. Recommended value is 1.0.'
 )
 ap.add_argument(
     '--debug',
@@ -84,7 +87,8 @@ ap.add_argument(
     help = 'Print debugging messages.'
 )
 def process_image(source, destination, distort):
-    log.debug("distorting: src:'%s', dst:'%s' ", source, destination)
+    log = logging.getLogger("distortioner.process_image")
+    log.debug("src:'%s', dst:'%s' ", source, destination)
     with Image(filename=source) as original:
         dst_width = int(original.width*(distort / 100.))
         dst_height = int(original.height*(distort / 100.))
@@ -96,8 +100,14 @@ def process_image(source, destination, distort):
             distorted.save(out)
 
 async def process_frames(coro, queue_in, out_pile):
+    log = logging.getLogger("distortioner.process_frames")
+    log.debug("started")
     while True:
-        frame_data = await queue_in.get()
+        log.debug("queue_in.get")
+        try:
+            frame_data = await queue_in.get()
+        except asyncio.exceptions.CancelledError:
+            return
         nr = frame_data.pop('nr')
         log.debug("processing frame '%s'", frame_data)
         await asyncio.to_thread(coro, **frame_data)
@@ -109,7 +119,10 @@ async def process_frames(coro, queue_in, out_pile):
         
 
 async def read_frames(capture, frames_distorted, frames_original, queue, tasks, distort_start, distort_end=None, distort_end_frame=None):
+    log = logging.getLogger("distortioner.read_frames")
+    log.debug("started")
     frames_read = 0
+    distort = distort_start
     if distort_end_frame is None:
         distort_end_frame = int(capture.get(cv2.CAP_PROP_FRAME_COUNT))
     while True:
@@ -125,7 +138,7 @@ async def read_frames(capture, frames_distorted, frames_original, queue, tasks, 
         frame_original = str(Path(frames_original)/frame_filename)
         frame_distorted = str(Path(frames_distorted)/frame_filename)
         cv2.imwrite(frame_original, frame)
-        log.debug("saving frame %i: filename: %s", frames_read, frame_filename)
+        log.debug("requesting frame dump %i: filename: %s", frames_read, frame_filename)
         await queue.put({
             'source': frame_original,
             'destination': frame_distorted,
@@ -140,16 +153,23 @@ async def read_frames(capture, frames_distorted, frames_original, queue, tasks, 
         worker.cancel()
 
 async def write_frames(output, pile):
+    log = logging.getLogger("distortioner.write_frames")
+    log.debug("started")
     while True:
-        log.debug("getting next item ...")
-        frame_distorted = await pile.pop()
-        log.info("writing frame '%s'", frame_distorted)
+        log.debug("getting next item to write ...")
+        try:
+            frame_distorted = await pile.pop()
+        except asyncio.exceptions.CancelledError:
+            return
+        log.info("writing frame to video '%s'", frame_distorted)
         newframe = cv2.imread(frame_distorted)
         output.write(newframe)
         log.debug("finished frame '%s'", frame_distorted)
 
 
 async def distort_video(capture, output, distort_start, distort_end=None, distort_end_frame=None):
+    log = logging.getLogger("distortioner.distort_video")
+    log.debug("started")
     distort = distort_start
     video_width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH))
     video_height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
@@ -167,7 +187,7 @@ async def distort_video(capture, output, distort_start, distort_end=None, distor
         generator = asyncio.create_task(read_frames(
             capture, frames_distorted, frames_original, capture_queue, workers, distort_start, distort_end, distort_end_frame
         ))
-        await asyncio.gather(generator, *workers, return_exceptions=True)
+        await asyncio.gather(*workers)
 
     log.debug('done with distorting video frames')
 
@@ -212,7 +232,10 @@ def main():
         asyncio.run(distort_video(capture, output, args.distort_percentage, args.distort_percentage_end, frames-1))
         capture.release()
         output.release()
-        distort_audio(tmpout, args.input, args.vibrato_frequency, args.vibrato_modulation_depth, args.output)
+        if args.vibrato_frequency is not None and args.vibrato_modulation_depth is not None:
+            distort_audio(tmpout, args.input, args.vibrato_frequency, args.vibrato_modulation_depth, args.output)
+        else:
+            move(tmpout, args.output)
 
 
 if __name__ == '__main__':
